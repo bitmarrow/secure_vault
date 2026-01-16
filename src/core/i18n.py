@@ -248,6 +248,7 @@ TRANSLATIONS = {
         # Errors (Logic level)
         'error_disk_full': '目标磁盘空间不足 (需要 {size})',
         'error_key_mismatch': '无法导入：此仓库的主密钥与当前登录的主密钥不匹配。',
+        'error_no_key_hash': '无法导入：此仓库配置缺少密钥验证信息。',
         'error_path_exists': '此仓库路径已存在',
         'error_repo_corrupt': '仓库数据不存在或已损坏',
         'error_name_empty': '名称不能为空',
@@ -503,6 +504,7 @@ TRANSLATIONS = {
         # Errors (Logic level)
         'error_disk_full': 'Insufficient disk space (needs {size})',
         'error_key_mismatch': 'Import failed: Master key mismatch.',
+        'error_no_key_hash': 'Import failed: Repository config missing key verification.',
         'error_path_exists': 'Repository path already exists',
         'error_repo_corrupt': 'Repository data missing or corrupt',
         'error_name_empty': 'Name cannot be empty',

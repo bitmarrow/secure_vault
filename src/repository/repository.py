@@ -169,7 +169,6 @@ def save_repository_config(repo: Repository, master_key_hash: str = None) -> Non
     config_path = Path(repo.path) / RepositoryDatabase.VAULT_DIR / "config.json"
     config_data = {
         "name": repo.name,
-        "path": repo.path,
         "max_capacity": repo.max_capacity,
         "version": "1.0"
     }
@@ -197,8 +196,8 @@ def load_repository_config(config_path: str) -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
     
-    # Validate required fields
-    required = ["name", "path", "max_capacity"]
+    # Validate required fields (path is now derived from config.json location)
+    required = ["name", "max_capacity", "master_key_hash"]
     for field in required:
         if field not in config:
             raise ValueError(f"Missing required field: {field}")
@@ -255,11 +254,13 @@ def import_repository(config_path: str, master_key: bytes) -> tuple:
     vault_dir = config_file.parent  # .vault directory
     repo_path = str(vault_dir.parent)  # actual repository path
     
-    # Verify master key hash if present
-    if "master_key_hash" in config:
-        current_hash = compute_key_hash(master_key)
-        if config["master_key_hash"] != current_hash:
-            raise ValueError(_("error_key_mismatch"))
+    # Verify master key hash - required for security
+    if "master_key_hash" not in config:
+        raise ValueError(_("error_no_key_hash"))
+    
+    current_hash = compute_key_hash(master_key)
+    if config["master_key_hash"] != current_hash:
+        raise ValueError(_("error_key_mismatch"))
     
     # Check if path already exists in our database
     existing_repos = list_repositories()
@@ -283,8 +284,9 @@ def import_repository(config_path: str, master_key: bytes) -> tuple:
     # Register in global database
     repo = Repository.create(final_name, repo_path, config["max_capacity"])
     
-    # Update config with correct path
-    save_repository_config(repo)
+    # Update config with correct path and preserve key hash for security
+    current_key_hash = compute_key_hash(master_key)
+    save_repository_config(repo, current_key_hash)
     
     return repo, was_renamed, None
 

@@ -495,6 +495,8 @@ class FileExporter:
         """Manually set progress tracking params for multi-file operations."""
         self.progress_tracker.processed_bytes = processed
         self.progress_tracker.set_total(total)
+        # Force an immediate callback to ensure UI receives correct total_bytes
+        self.progress_tracker.update(0, "Starting...", force=True)
     
     def export_decrypted(
         self,
@@ -589,6 +591,9 @@ class FileExporter:
                     # File might be already done
                     return
 
+        # Trigger initial progress update so UI shows activity immediately
+        self.progress_tracker.update(0, f"Decrypting: {name}", force=True)
+        
         # Parallel block retrieval and decryption
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = []
