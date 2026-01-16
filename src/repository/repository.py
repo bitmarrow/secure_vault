@@ -234,6 +234,10 @@ def import_repository(config_path: str, master_key: bytes) -> tuple:
     """
     Import a repository from its config file.
     
+    The actual repository path is derived from the config.json location
+    (parent of .vault directory), not from the path stored in config.
+    This allows importing repositories that have been moved.
+    
     Args:
         config_path: Path to config.json file
     
@@ -244,7 +248,12 @@ def import_repository(config_path: str, master_key: bytes) -> tuple:
         ValueError: If import fails
     """
     config = load_repository_config(config_path)
-    repo_path = config["path"]
+    
+    # Derive actual repo path from config.json location
+    # config.json is in .vault/, so parent of .vault is the repo path
+    config_file = Path(config_path).resolve()
+    vault_dir = config_file.parent  # .vault directory
+    repo_path = str(vault_dir.parent)  # actual repository path
     
     # Verify master key hash if present
     if "master_key_hash" in config:
@@ -261,7 +270,6 @@ def import_repository(config_path: str, master_key: bytes) -> tuple:
             raise ValueError(_("error_path_exists"))
     
     # Check if the repository directory and database exist
-    vault_dir = Path(repo_path) / RepositoryDatabase.VAULT_DIR
     db_path = vault_dir / RepositoryDatabase.DB_NAME
     
     if not vault_dir.exists() or not db_path.exists():
@@ -275,9 +283,8 @@ def import_repository(config_path: str, master_key: bytes) -> tuple:
     # Register in global database
     repo = Repository.create(final_name, repo_path, config["max_capacity"])
     
-    # Update config if renamed
-    if was_renamed:
-        save_repository_config(repo)
+    # Update config with correct path
+    save_repository_config(repo)
     
     return repo, was_renamed, None
 
