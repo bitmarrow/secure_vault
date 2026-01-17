@@ -239,7 +239,7 @@ class FileTreeView(QTreeView):
     """Tree view for file explorer with drag-and-drop."""
     
     files_dropped = pyqtSignal(list, object)  # (file_paths, target_parent_id)
-    item_moved = pyqtSignal(int, object)  # (file_id, new_parent_id)
+    items_moved = pyqtSignal(list, object)  # (file_ids, new_parent_id)
     context_menu_requested = pyqtSignal(QModelIndex, object)  # (index, global_pos)
     
     def __init__(self, parent=None):
@@ -297,7 +297,7 @@ class FileTreeView(QTreeView):
         header.resizeSection(1, 150) # Date
         header.resizeSection(2, 100) # Size
         header.resizeSection(3, 80)  # Count
-    
+        
     def dragEnterEvent(self, event: QDragEnterEvent):
         """Handle drag enter."""
         super().dragEnterEvent(event)
@@ -349,8 +349,8 @@ class FileTreeView(QTreeView):
                         if vf:
                             file_ids.add(vf.id)
                 
-                for file_id in file_ids:
-                    self.item_moved.emit(file_id, target_parent_id)
+                if file_ids:
+                    self.items_moved.emit(list(file_ids), target_parent_id)
                 
                 event.acceptProposedAction()
     

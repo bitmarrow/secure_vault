@@ -125,20 +125,26 @@ class ProgressTracker:
             return _("eta_hours", h=int(seconds // 3600), m=int((seconds % 3600) // 60))
 
 
-def fast_scandir(path: Path) -> int:
-    """Rapidly calculate total size using os.scandir."""
+def fast_scandir(path: Path, callback: Optional[Callable] = None, state: dict = None) -> int:
+    """Rapidly calculate total size using os.scandir with optional throttled feedback."""
     total = 0
     try:
         if path.is_file():
             return path.stat().st_size
         
-        # Use os.scandir for better performance on Windows
+        # Throttling logic
+        if callback and state:
+            now = time.time()
+            if now - state.get('last_update', 0) >= 0.2:
+                callback(0, 0, f"{_('status_calculating')}: {path.name}")
+                state['last_update'] = now
+
         with os.scandir(str(path)) as it:
             for entry in it:
                 if entry.is_file(follow_symlinks=False):
                     total += entry.stat().st_size
                 elif entry.is_dir(follow_symlinks=False):
-                    total += fast_scandir(Path(entry.path))
+                    total += fast_scandir(Path(entry.path), callback, state)
     except (PermissionError, OSError):
         pass
     return total
@@ -187,9 +193,17 @@ class FileImporter:
             master_key
         )
         
-        self.progress_tracker = ProgressTracker(progress_callback)
         self.is_cancelled = is_cancelled or (lambda: False)
         self.logger = get_logger()
+        
+        # Unified throttled callback for both UI and DB
+        def unified_callback(current, total, msg, speed, eta):
+            if progress_callback:
+                progress_callback(current, total, msg, speed, eta)
+            if self.operation:
+                self.operation.update_progress(self.repository.path, current)
+                
+        self.progress_tracker = ProgressTracker(unified_callback)
         self._created_file_ids: list[int] = []  # Track created files for rollback
 
     def set_total_bytes(self, total_bytes: int):
@@ -320,6 +334,9 @@ class FileImporter:
                 with db.transaction():
                     batch_mappings = []
                     for future in futures:
+                        if self.is_cancelled():
+                            raise OperationCancelled("Import cancelled by user")
+                            
                         prepared = future.result()
                         block, _ = self.block_manager.store_prepared_block(prepared)
                         batch_mappings.append((virtual_file.id, block.id, block_order))
@@ -329,12 +346,6 @@ class FileImporter:
                             prepared["original_size"], 
                             f"Encrypting: {file_path.name}"
                         )
-                        
-                        if self.operation:
-                            self.operation.update_progress(
-                                self.repository.path, 
-                                self.progress_tracker.processed_bytes
-                            )
                     
                     # Commit this batch immediately for breakpoint support
                     FileBlockMapping.create_batch(batch_mappings, self.repository.path)
@@ -445,12 +456,15 @@ class FileImporter:
 
     @staticmethod
     def calculate_total_import_size(file_paths: list[Path], progress_callback: Optional[Callable] = None) -> int:
-        """Calculate total size for a list of paths with feedback."""
+        """Calculate total size for a list of paths with throttled feedback."""
         total = 0
+        state = {'last_update': 0}
         for i, path in enumerate(file_paths):
+            total += fast_scandir(path, progress_callback, state)
+            
+            # Ensure at least one update for each top-level item if it's long
             if progress_callback:
-                progress_callback(0, 0, f"Scanning: {path.name} ({i+1}/{len(file_paths)})", "", "")
-            total += fast_scandir(path)
+                progress_callback(0, 0, f"{_('status_calculating')}: {path.name} ({i+1}/{len(file_paths)})", "", "")
         return total
     
     
@@ -485,9 +499,17 @@ class FileExporter:
         self.master_key = master_key
         self.operation = operation
         self.block_manager = BlockManager(repository.path, master_key)
-        self.progress_tracker = ProgressTracker(progress_callback)
         self.is_cancelled = is_cancelled or (lambda: False)
         self.logger = get_logger()
+        
+        # Unified throttled callback for both UI and DB
+        def unified_callback(current, total, msg, speed, eta):
+            if progress_callback:
+                progress_callback(current, total, msg, speed, eta)
+            if self.operation:
+                self.operation.update_progress(self.repository.path, current)
+                
+        self.progress_tracker = ProgressTracker(unified_callback)
         self._output_dir: Optional[Path] = None  # Track final output
         self._missing_blocks: list[str] = []
         
@@ -594,42 +616,46 @@ class FileExporter:
         # Trigger initial progress update so UI shows activity immediately
         self.progress_tracker.update(0, f"Decrypting: {name}", force=True)
         
-        # Parallel block retrieval and decryption
+        # Parallel block retrieval and decryption in batches
+        BATCH_SIZE = 16
         with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = []
             # Skip already exported blocks
             relevant_blocks = blocks[start_block_index:]
             
-            for block in relevant_blocks:
-                if not self.block_manager.block_exists(block):
-                    self._missing_blocks.append(f"{name}: Block {block.relative_path}")
-                    futures.append(None)
-                    continue
-                
-                future = executor.submit(self.block_manager.retrieve_block_data, block)
-                futures.append(future)
-            
             with open(output_path, file_mode) as f:
-                for i, future in enumerate(futures):
-                    if future is None:
-                        continue
+                for i in range(0, len(relevant_blocks), BATCH_SIZE):
+                    if self.is_cancelled():
+                        raise OperationCancelled("Export cancelled by user")
                     
-                    try:
-                        data = future.result()
-                        f.write(data)
+                    batch = relevant_blocks[i:i + BATCH_SIZE]
+                    futures = []
+                    
+                    for block in batch:
+                        if not self.block_manager.block_exists(block):
+                            self._missing_blocks.append(f"{name}: Block {block.relative_path}")
+                            futures.append(None)
+                            continue
                         
-                        self.progress_tracker.update(len(data), f"Decrypting: {name}")
+                        future = executor.submit(self.block_manager.retrieve_block_data, block)
+                        futures.append(future)
+                    
+                    for future in futures:
+                        if future is None:
+                            continue
                         
-                        if self.operation:
-                            self.operation.update_progress(
-                                self.repository.path, 
-                                self.progress_tracker.processed_bytes
-                            )
-                        
-                        if self.is_cancelled():
-                            raise OperationCancelled("Export cancelled by user")
-                    except Exception as e:
-                        self._missing_blocks.append(f"{name}: {str(e)}")
+                        try:
+                            # Still check cancellation per result for extreme responsiveness
+                            if self.is_cancelled():
+                                raise OperationCancelled("Export cancelled by user")
+                                
+                            data = future.result()
+                            f.write(data)
+                            
+                            self.progress_tracker.update(len(data), f"Decrypting: {name}")
+                        except OperationCancelled:
+                            raise
+                        except Exception as e:
+                            self._missing_blocks.append(f"{name}: {str(e)}")
     
     def _export_folder_recursive(
         self,
@@ -678,24 +704,34 @@ class FileExporter:
 
     @staticmethod
     def calculate_total_export_size(files: list[VirtualFile], repository_path: str, progress_callback: Optional[Callable] = None) -> int:
-        """Calculate total size for a list of virtual files with feedback."""
+        """Calculate total size for a list of virtual files with throttled feedback."""
         total = 0
+        state = {'last_update': 0}
         for i, vf in enumerate(files):
+            total += FileExporter._calculate_recursive_size(vf, repository_path, progress_callback, state)
+            
             if progress_callback:
-                progress_callback(0, 0, f"Scanning: Item {i+1}/{len(files)}", "", "")
-            total += FileExporter._calculate_recursive_size(vf, repository_path)
+                # Force update for major items
+                progress_callback(0, 0, f"{_('status_calculating')} ({i+1}/{len(files)})", "", "")
         return total
 
     @staticmethod
-    def _calculate_recursive_size(vf: VirtualFile, repository_path: str) -> int:
-        """Helper to calculate size recursively."""
+    def _calculate_recursive_size(vf: VirtualFile, repository_path: str, callback: Optional[Callable] = None, state: dict = None) -> int:
+        """Helper to calculate size recursively with throttling."""
         if not vf.is_directory:
             return vf.size
         
+        # Throttling
+        if callback and state:
+            now = time.time()
+            if now - state.get('last_update', 0) >= 0.2:
+                callback(0, 0, f"{_('status_calculating')}")
+                state['last_update'] = now
+
         total = 0
         children = VirtualFile.get_children(repository_path, vf.id)
         for child in children:
-            total += FileExporter._calculate_recursive_size(child, repository_path)
+            total += FileExporter._calculate_recursive_size(child, repository_path, callback, state)
         return total
 
 
@@ -741,16 +777,27 @@ class BatchFileDeleter:
         repository: Repository, 
         master_key: bytes,
         progress_callback: Optional[Callable[[int, int, str, str, str], None]] = None,
-        is_cancelled: Optional[Callable[[], bool]] = None
+        is_cancelled: Optional[Callable[[], bool]] = None,
+        operation: Optional["Operation"] = None
     ):
         self.repository = repository
         self.master_key = master_key
         self.block_manager = BlockManager(repository.path, master_key)
-        self.progress_tracker = ProgressTracker(progress_callback)
+        self.operation = operation
         self.is_cancelled = is_cancelled or (lambda: False)
         self.logger = get_logger()
         self._processed_count = 0
         self._total_count = 0
+        
+        # Unified callback that also updates DB
+        def unified_callback(current, total, msg, speed, eta):
+            if progress_callback:
+                progress_callback(current, total, msg, speed, eta)
+            if self.operation:
+                # For deletion, processed_size is current percentage if total=100
+                self.operation.update_progress(self.repository.path, current)
+                
+        self.progress_tracker = ProgressTracker(unified_callback)
         
     def delete(self, virtual_files: list[VirtualFile]) -> None:
         """Optimized deletion of multiple virtual files/folders."""

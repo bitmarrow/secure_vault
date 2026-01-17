@@ -43,7 +43,7 @@ from src.ui.main.log_widget import LogWidget
 class WorkerThread(QThread):
     """Thread for background file operations."""
     
-    progress = pyqtSignal(int, int, str, str, str)
+    progress = pyqtSignal(object, object, str, str, str) # Use object to pass Python's big ints without any C++ 32-bit truncation
     finished = pyqtSignal(bool, str)
     
     def __init__(self, operation, *args, **kwargs):
@@ -98,6 +98,27 @@ class MainWindow(QMainWindow):
         
         # Check for pending operations to resume
         self._check_pending_operations()
+        
+        # Periodic persistence timer (flush progress every 3s)
+        self._persistence_timer = QTimer(self)
+        self._persistence_timer.timeout.connect(self._save_progress_heartbeat)
+        self._persistence_timer.start(3000)
+
+    def _save_progress_heartbeat(self):
+        """Periodically flush current operation progress to DB to ensure persistence."""
+        if hasattr(self, '_current_operation') and self._current_operation:
+            # We don't update if nothing changed? 
+            # Actually Operation.update_progress already throttles or is fast.
+            # But here we double-check if we have an active worker.
+            if self._worker and self._worker.isRunning():
+                # We can't easily get the precise bytes here without a tracker reference,
+                # but the Operations inside the workers (FileImporter/Exporter) 
+                # already update the DB via unified_callback.
+                # This heartbeat serves as an extra safety layer and "alive" signal.
+                try:
+                    self._current_operation.update_progress(self.repository.path, self._current_operation.processed_size)
+                except Exception:
+                    pass
 
     def _check_pending_operations(self):
         """Check for and resume any pending operations."""
@@ -115,6 +136,8 @@ class MainWindow(QMainWindow):
                     QTimer.singleShot(1000, lambda o=op: self._resume_import(o))
                 elif op.type == 'export':
                     QTimer.singleShot(1000, lambda o=op: self._resume_export(o))
+                elif op.type == 'delete':
+                    QTimer.singleShot(1000, lambda o=op: self._resume_delete(o))
             elif op.status == 'cancelling':
                 self.logger.info(_("log_resume_cleanup", type=op.type))
                 QTimer.singleShot(1000, lambda o=op: self._resume_cleanup(o))
@@ -202,7 +225,8 @@ class MainWindow(QMainWindow):
         self.logger.info(_("log_force_cleanup", id=op.id))
         self._active_task = op.type
         self._current_operation = op
-        self._cleanup_current_task(force_record_delete=True)
+        # Perform rollback/deletion since we are resuming a cancelled/broken task
+        self._cleanup_current_task(cleanup_success=False)
 
     def _setup_window(self):
         """Setup window properties."""
@@ -328,7 +352,7 @@ class MainWindow(QMainWindow):
         """Connect UI signals."""
         # Tree view signals
         self.tree_view.files_dropped.connect(self._on_files_dropped)
-        self.tree_view.item_moved.connect(self._on_item_moved)
+        self.tree_view.items_moved.connect(self._on_items_moved)
         self.tree_view.context_menu_requested.connect(self._on_context_menu)
         
         # Context menu signals
@@ -589,7 +613,7 @@ class MainWindow(QMainWindow):
                 self.logger.operation(_("log_system"), _("log_repo_deleted_exit"))
                 self._restart_app()  # Restart to PIN window instead of quit
 
-    @pyqtSlot(int, int, str, str, str)
+    @pyqtSlot(object, object, str, str, str)
     def _on_progress_update(self, current, total, message, speed="", eta=""):
         """Handle progress updates in a thread-safe way."""
         display_msg = ""
@@ -613,6 +637,47 @@ class MainWindow(QMainWindow):
         self.capacity_label.setText(
             _("info_used", used=format_size(stats['used']), total=format_size(stats['max_capacity']))
         )
+
+    def _make_progress_callback(self, op: Optional[Operation]):
+        """
+        Creates a robust progress callback for file operations.
+        Handles resumption logic, catch-up protection, and 64-bit safe signals.
+        """
+        def progress_callback(current, total, message, speed="", eta=""):
+            if not self._worker:
+                return
+            
+            # 1. Coordinate parsing (use Python's big ints)
+            cur = int(current)
+            tot = int(total)
+            base_cur = int(op.processed_size) if op else 0
+            base_tot = int(op.total_size) if op else 0
+            
+            # 2. Resumption/Scanning Adjustment
+            display_cur, display_tot = cur, tot
+            if base_tot > 0:
+                # Catch-up phase: either total is unknown or worker hasn't reached past progress
+                if tot <= 0 or cur < base_cur:
+                    display_cur = max(cur, base_cur)
+                    display_tot = max(tot, base_tot)
+                    
+                    # Improve message during catch-up
+                    resuming_tag = f"[{_('status_resuming')}] "
+                    if message and resuming_tag not in message:
+                        message = resuming_tag + message
+            
+            # 3. Denominator Stability (fallback to known total or arbitrary 1)
+            if display_tot <= 0:
+                display_tot = base_tot if base_tot > 0 else 1
+            
+            # 4. Final Clamping & Overflow Protection
+            if display_cur < 0: display_cur = 0
+            if display_cur > display_tot: display_cur = display_tot
+            
+            # Pass original big ints as 'object' through signal
+            self._worker.progress.emit(display_cur, display_tot, message, speed, eta)
+            
+        return progress_callback
     
     # File operation handlers
     
@@ -640,10 +705,16 @@ class MainWindow(QMainWindow):
                 parent_id=parent_id
             )
             self._current_operation = op
+        progress_callback = self._make_progress_callback(op)
         
-        def progress_callback(current, total, message, speed="", eta=""):
-            if self._worker:
-                self._worker.progress.emit(current, total, message, speed, eta)
+        importer = FileImporter(
+            self.repository,
+            self.master_key,
+            progress_callback,
+            is_cancelled=self._worker_ref_callback, # We'll need a way to get worker ref
+            operation=op
+        )
+        self._current_importer = importer
         
         def import_files():
             # Convert strings to Path objects
@@ -656,18 +727,9 @@ class MainWindow(QMainWindow):
             if not existing_op:
                 db = get_repository_database(self.repository.path)
                 db.execute("UPDATE operations SET total_size = ? WHERE id = ?", (total_size, op.id))
+                op.total_size = total_size # Update locally for callback
             
-            importer = FileImporter(
-                self.repository,
-                self.master_key,
-                progress_callback,
-                is_cancelled=self._worker.is_cancelled,
-                operation=op
-            )
             importer.set_total_bytes(total_size)
-            
-            # Store importer for rollback access
-            self._current_importer = importer
             
             for path_obj in paths:
                 if self._worker.is_cancelled():
@@ -690,28 +752,34 @@ class MainWindow(QMainWindow):
             log_action=_("type_import")
         )
     
-    def _on_item_moved(self, file_id: int, new_parent_id):
-        """Handle internal item move."""
-        vf = VirtualFile.get_by_id(file_id)
-        if vf:
-            # Check for name collision in new parent
-            # Get existing files in target directory
-            existing_files = VirtualFile.get_children(self.repository.path, new_parent_id)
-            existing_names = set()
-            for existing in existing_files:
-                if existing.id == file_id:  # Skip self if moving to same dir (though UI shouldn't allow)
-                    continue
-                try:
-                    name = decrypt_metadata(
-                        existing.name_encrypted,
-                        self.master_key,
-                        existing.name_nonce
-                    )
-                    existing_names.add(name)
-                except Exception:
-                    continue
+    def _on_items_moved(self, file_ids: list[int], new_parent_id: Optional[int]):
+        """Handle internal items movement in batch."""
+        if not file_ids:
+            return
             
-            # Decrypt current name
+        self.logger.info(_("log_moving_items", count=len(file_ids)))
+        
+        # 1. Pre-fetch existing names in the target directory to optimize collision checks
+        from src.database.models import VirtualFile
+        existing_files = VirtualFile.get_children(self.repository.path, new_parent_id)
+        existing_names = set()
+        for existing in existing_files:
+            # We will ignore files being moved if they are already in target dir
+            try:
+                name = decrypt_metadata(
+                    existing.name_encrypted,
+                    self.master_key,
+                    existing.name_nonce
+                )
+                existing_names.add(name)
+            except Exception:
+                continue
+                
+        # 2. Fetch files to be moved
+        vfs = VirtualFile.get_batch(file_ids, self.repository.path)
+        move_ids = []
+        
+        for vf in vfs:
             try:
                 current_name = decrypt_metadata(
                     vf.name_encrypted,
@@ -719,27 +787,35 @@ class MainWindow(QMainWindow):
                     vf.name_nonce
                 )
                 
-                # Get unique name
+                # Check for collision and get unique name if needed
                 new_name = get_unique_filename(current_name, existing_names)
                 
-                # If name changed, update encryption
                 if new_name != current_name:
                     name_encrypted, name_nonce = encrypt_metadata(
                         new_name, self.master_key
                     )
-                    vf.name_encrypted = name_encrypted
-                    vf.name_nonce = name_nonce
-                    vf.save()  # Save name change
-                    
-                    self.log_widget.add_info(_("log_rename_to", name=new_name))
-                    
+                    vf.update_name(name_encrypted, name_nonce, self.repository.path)
+                    self.logger.info(_("log_rename_to", name=new_name))
+                else:
+                    # If no rename, add to batch move list
+                    # (Renamed files are technically "moved" too, but update_name doesn't move)
+                    pass
+                
+                # Always add to move list for parent_id update
+                move_ids.append(vf.id)
+                # Add to existing names so subsequent files in this batch don't collide with it
+                existing_names.add(new_name)
+                
             except Exception as e:
-                self.logger.error(f"Move failed during name resolution: {e}")
-                return
-
-            vf.move(new_parent_id)
-            self._load_files()
-            self.logger.operation(_("log_move"), _("log_file_id", id=file_id))
+                self.logger.error(f"Move failed for item {vf.id}: {e}")
+        
+        # 3. Perform batch move in DB
+        if move_ids:
+            VirtualFile.move_batch(move_ids, new_parent_id, self.repository.path)
+            
+        # 4. Single UI refresh
+        self._load_files()
+        self.logger.operation(_("log_move"), _("log_items_count", count=len(move_ids)))
     
     def _on_context_menu(self, index, global_pos):
         """Show context menu."""
@@ -776,6 +852,16 @@ class MainWindow(QMainWindow):
         
         self._active_task = "delete"
         
+        # Create operation record for persistent deletion
+        source_ids = [f.id for f in files]
+        op = Operation.create(
+            self.repository.path,
+            'delete',
+            source_ids, # Store IDs as source paths
+            total_size=len(files) # For deletion, total_size is item count
+        )
+        self._current_operation = op
+        
         self.logger.operation_start(_("log_delete"), _("msg_deleted_count", count=len(files)))
         
         def do_delete():
@@ -783,9 +869,13 @@ class MainWindow(QMainWindow):
                 self.repository, 
                 self.master_key, 
                 lambda c, t, m, s="", e="": self._worker.progress.emit(c, t, m, s, e),
-                is_cancelled=self._worker.is_cancelled
+                is_cancelled=self._worker.is_cancelled,
+                operation=op
             )
             deleter.delete(files)
+            
+            # Remove operation record on success
+            op.delete(self.repository.path)
             
             return None  # Success signal for _run_in_background
 
@@ -794,6 +884,53 @@ class MainWindow(QMainWindow):
             success_msg=_("msg_deleted_count", count=len(files)),
             log_action=_("log_delete")
         )
+
+    def _resume_delete(self, op: Operation):
+        """Resume persistent deletion task."""
+        try:
+            import json
+            file_ids = json.loads(op.source_paths)
+            
+            # Fetch VirtualFiles by IDs
+            from src.database.models import VirtualFile
+            files = VirtualFile.get_batch(file_ids, self.repository.path)
+            
+            if not files:
+                self.logger.info(_("log_resume_nothing_to_delete"))
+                op.delete(self.repository.path)
+                return
+                
+            self.logger.info(_("log_resume_success", type=_("log_delete"), id=op.id))
+            
+            # Set state
+            self._active_task = "delete"
+            self._current_operation = op
+            
+            # Logic similar to _on_delete_files but with existing_op
+            def do_delete():
+                deleter = BatchFileDeleter(
+                    self.repository, 
+                    self.master_key, 
+                    lambda c, t, m, s="", e="": self._worker.progress.emit(c, t, m, s, e),
+                    is_cancelled=self._worker.is_cancelled,
+                    operation=op
+                )
+                deleter.delete(files)
+                
+                # Remove operation record on success
+                op.delete(self.repository.path)
+                
+                return None  # Success
+                
+            self._run_in_background(
+                do_delete,
+                success_msg=_("msg_deleted_count", count=len(files)),
+                log_action=_("log_delete")
+            )
+            
+        except Exception as e:
+            self.logger.error(_("log_task_failed", type=_("log_delete"), error=e))
+            op.update_status(self.repository.path, 'failed', str(e))
         
     def _on_new_folder(self, parent_file: Optional[VirtualFile]):
         """Handle new folder creation."""
@@ -937,25 +1074,34 @@ class MainWindow(QMainWindow):
                 self._active_task = None
                 return
         
+        progress_callback = self._make_progress_callback(op)
+
+        exporter = FileExporter(
+            self.repository,
+            self.master_key,
+            progress_callback,
+            is_cancelled=self._worker_ref_callback,
+            operation=op
+        )
+        # Store in MainWindow if we want, but local closure reference is fine as long as we don't need it elsewhere
+        # We don't have a self._current_exporter attribute used in cleanup yet, 
+        # but let's add it for consistency if we want to cleanup exported files.
+        # Actually our cleanup logic uses op.source_paths, so it doesn't need exporter ref.
+        
         def export():
             # Pre-calculate total size
-            self._worker.progress.emit(0, 0, "Calculating total size...", "", "")
-            total_size = FileExporter.calculate_total_export_size(files, self.repository.path)
+            total_size = FileExporter.calculate_total_export_size(
+                files, self.repository.path, progress_callback
+            )
             
             # Update op with total size
             if not existing_op:
                 db = get_repository_database(self.repository.path)
                 db.execute("UPDATE operations SET total_size = ? WHERE id = ?", (total_size, op.id))
+                op.total_size = total_size # Update locally for callback
 
-            exporter = FileExporter(
-                self.repository,
-                self.master_key,
-                lambda c, t, m, s="", e="": self._worker.progress.emit(c, t, m, s, e),
-                is_cancelled=self._worker.is_cancelled,
-                operation=op
-            )
-            # Use recorded processed_size for resumption
-            exporter.set_progress_params(op.processed_size, total_size)
+            # Always start from 0 because Exporter will reconstruct progress via scanning (avoid double counting)
+            exporter.set_progress_params(0, total_size)
             
             for vf in files:
                 if self._worker.is_cancelled():
@@ -1025,6 +1171,9 @@ class MainWindow(QMainWindow):
                 for item in log_items:
                     self.logger.debug(_("log_item_finished", action=log_action, item=item))
             
+            # Synchronized cleanup for successful task (removes DB record)
+            self._cleanup_current_task(cleanup_success=True)
+            
             self._load_files()
             self._update_capacity()
             
@@ -1037,95 +1186,116 @@ class MainWindow(QMainWindow):
         elif message == "__CANCELLED__":
             self.progress_widget.set_complete(_("msg_cancelled"))
             self.log_widget.add_info(_("log_cancelled_by_user"))
-            self._cleanup_current_task()
+            # Synchronized cleanup for cancelled task (performs rollback/deletion)
+            self._cleanup_current_task(cleanup_success=False)
             self._load_files()
             self._update_capacity()
         else:
             self.progress_widget.set_error(message)
             self.logger.error(message)
-            # Handle failure - might want to keep the record or mark as failed
-            op = getattr(self, '_current_operation', None)
-            if op:
-                op.update_status(self.repository.path, 'failed', message)
-        
-        # Clear active task
-        self._active_task = None
-        self._current_operation = None
-        self._current_importer = None  # Clear importer ref
-        self._current_task_phase = 0
-    
-    def _on_cancel(self):
-        """Handle cancel request with task-specific rollback."""
-        if self._worker and self._worker.isRunning():
-            self._worker.cancel()
-            self.progress_widget.reset()
-            
-            # Perform task-specific cleanup
-            self._cleanup_current_task()
-            
-            self.log_widget.add_info(_("log_cancelled_rolled_back"))
+            # Synchronized cleanup for failed task (performs rollback/deletion)
+            self._cleanup_current_task(cleanup_success=False)
             self._load_files()
             self._update_capacity()
         
-        # Clear active task
+        # Finally clear active task state
         self._active_task = None
         self._current_operation = None
+        self._current_importer = None
         self._current_task_phase = 0
     
-    def _cleanup_current_task(self, force_record_delete=False, is_exit=False):
-        """Clean up resources based on current active task type and update operation status."""
+    def _worker_ref_callback(self):
+        """Helper to get cancellation status from current worker."""
+        if self._worker:
+            return self._worker.is_cancelled()
+        return False
+
+    def _on_cancel(self):
+        """Handle cancel request with task-specific rollback."""
+        if self._worker and self._worker.isRunning():
+            # Update status in DB so resume logic knows we were cancelling
+            op = getattr(self, '_current_operation', None)
+            if op:
+                op.update_status(self.repository.path, 'cancelling')
+                self.logger.info(_("log_cleanup_recorded"))
+            
+            self._worker.cancel()
+            self.progress_widget.set_status(_("status_cancelling")) # Update UI feedback
+    
+    def _cleanup_current_task(self, cleanup_success=False, is_exit=False):
+        """
+        Clean up resources based on current active task type.
+        
+        Args:
+            cleanup_success: If True, only delete the operation record.
+                            If False, perform full rollback (delete partial files).
+            is_exit: If True, keep the record for resumption.
+        """
         if not self._active_task:
             return
         
         op = getattr(self, '_current_operation', None)
-        if op:
-            if is_exit:
-                # On exit, we just leave it as 'processing' so it auto-resumes next time
-                self.logger.info(_("log_pause_on_exit"))
-            else:
-                op.update_status(self.repository.path, 'cancelling')
-                self.logger.info(_("log_cleanup_recorded"))
-
-        if not is_exit and self._active_task == "encrypt":
-            # Rollback importer (deletes created virtual files and blocks)
-            if hasattr(self, '_current_importer') and self._current_importer:
-                try:
-                    for fid in self._current_importer._created_file_ids:
-                        vf = VirtualFile.get_by_id(fid, self.repository.path)
-                        if vf:
-                            from src.database.models import FileBlockMapping, Block
-                            bids = FileBlockMapping.remove_mappings_for_file(fid, self.repository.path)
-                            Block.decrement_batch(bids, self.repository.path)
-                            vf.delete()
-                except Exception as e:
-                    self.logger.error(f"Rollback failed: {e}")
-                self._current_importer = None
         
-        elif self._active_task == "decrypt_export":
-            # Delete partially exported files ONLY if we are actually cancelling, not just exiting
-            if not is_exit and op and op.target_path:
-                try:
-                    target_dir = Path(op.target_path)
-                    source_ids = json.loads(op.source_paths)
-                    for fid in source_ids:
-                        vf = VirtualFile.get_by_id(fid, self.repository.path)
-                        if vf:
-                            # Decrypt name to find the file
+        # 1. Exit handling (No deletion, just pause)
+        if is_exit:
+            if op:
+                self.logger.info(_("log_pause_on_exit"))
+                # Status remains 'processing' in DB
+            return
+
+        # 2. Failure/Cancellation Rollback
+        if not cleanup_success:
+            if self._active_task in ("encrypt", "import"):
+                # Rollback importer (deletes created virtual files and blocks)
+                if hasattr(self, '_current_importer') and self._current_importer:
+                    try:
+                        fids = self._current_importer._created_file_ids
+                        if fids:
+                            self.logger.info(_("log_rollback_files", count=len(fids)))
+                            from src.database.models import FileBlockMapping, Block, VirtualFile
+                            # Use new batch methods for extreme performance
+                            bids = FileBlockMapping.remove_mappings_for_files_batch(fids, self.repository.path)
+                            if bids:
+                                Block.decrement_batch(bids, self.repository.path)
+                            VirtualFile.delete_batch(fids, self.repository.path)
+                    except Exception as e:
+                        self.logger.error(f"Import rollback failed: {e}")
+            
+            elif self._active_task in ("decrypt_export", "export"):
+                # Delete partially exported files
+                if op and op.target_path:
+                    try:
+                        target_dir = Path(op.target_path)
+                        source_ids = json.loads(op.source_paths)
+                        self.logger.info(_("log_cleanup_files", count=len(source_ids)))
+                        
+                        # Optimization: Get all metadata in batch to avoid O(N) queries
+                        from src.database.models import VirtualFile
+                        vfs = VirtualFile.get_batch(source_ids, self.repository.path)
+                        
+                        for vf in vfs:
                             name = decrypt_metadata(vf.name_encrypted, self.master_key, vf.name_nonce)
                             target_file = target_dir / name
                             if target_file.exists():
                                 if target_file.is_dir():
-                                    shutil.rmtree(target_file)
+                                    shutil.rmtree(target_file, ignore_errors=True)
                                 else:
-                                    target_file.unlink()
-                except Exception as e:
-                    self.logger.error(f"Export cleanup failed: {e}")
+                                    target_file.unlink(missing_ok=True)
+                    except Exception as e:
+                        self.logger.error(f"Export cleanup failed: {e}")
 
-        # Finally delete the operation record if cleanup succeeded (and NOT just exiting)
-        if op and not is_exit:
-            op.delete(self.repository.path)
-            self._current_operation = None
-            self.logger.info(_("log_cleanup_finished"))
+        if op:
+            try:
+                op.delete(self.repository.path)
+                self.logger.info(_("log_cleanup_finished"))
+                self._current_operation = None
+            except Exception as e:
+                self.logger.debug(f"Op record deletion failed (might be already deleted): {e}")
+                
+        # Clear active state after cleanup unless exiting
+        self._active_task = None
+        self._current_task_phase = 0
+        self.logger.info(_("log_cleanup_finished"))
     
     def _can_start_task(self, task_name: str) -> bool:
         """Check if a new task can be started (mutual exclusion).

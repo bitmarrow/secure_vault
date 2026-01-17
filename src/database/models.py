@@ -222,6 +222,24 @@ class VirtualFile:
         return None
     
     @classmethod
+    def get_batch(cls, file_ids: list[int], repo_path: str = None) -> List["VirtualFile"]:
+        """Get multiple virtual files by ID in a single query."""
+        if not file_ids:
+            return []
+        db = get_repository_database(repo_path)
+        if db is None:
+            return []
+        
+        results = []
+        CHUNK_SIZE = 900
+        for i in range(0, len(file_ids), CHUNK_SIZE):
+            chunk = file_ids[i:i + CHUNK_SIZE]
+            placeholders = ",".join(["?"] * len(chunk))
+            rows = db.fetchall(f"SELECT * FROM files WHERE id IN ({placeholders})", tuple(chunk))
+            results.extend([cls._from_row(row) for row in rows])
+        return results
+
+    @classmethod
     def get_children(cls, repo_path: str, parent_id: Optional[int]) -> List["VirtualFile"]:
         """Get children of a directory."""
         db = get_repository_database(repo_path)
@@ -324,6 +342,21 @@ class VirtualFile:
         with db.transaction():
             # CASCADE will handle children and file_blocks
             db.execute("DELETE FROM files WHERE id = ?", (self.id,))
+
+    @classmethod
+    def delete_batch(cls, file_ids: list[int], repo_path: str = None) -> None:
+        """Delete multiple virtual files efficiently."""
+        if not file_ids:
+            return
+        db = get_repository_database(repo_path)
+        if db is None:
+            return
+        with db.transaction():
+            CHUNK_SIZE = 900
+            for i in range(0, len(file_ids), CHUNK_SIZE):
+                chunk = file_ids[i:i + CHUNK_SIZE]
+                placeholders = ",".join(["?"] * len(chunk))
+                db.execute(f"DELETE FROM files WHERE id IN ({placeholders})", chunk)
     
     def move(self, new_parent_id: Optional[int], repo_path: str = None) -> None:
         """Move file to a new parent directory."""
@@ -338,6 +371,24 @@ class VirtualFile:
                 (new_parent_id, self.id)
             )
         self.parent_id = new_parent_id
+
+    @classmethod
+    def move_batch(cls, file_ids: list[int], new_parent_id: Optional[int], repo_path: str = None) -> None:
+        """Move multiple files to a new parent directory in a single transaction."""
+        if not file_ids:
+            return
+        db = get_repository_database(repo_path)
+        if db is None:
+            return
+        with db.transaction():
+            CHUNK_SIZE = 900
+            for i in range(0, len(file_ids), CHUNK_SIZE):
+                chunk = file_ids[i:i + CHUNK_SIZE]
+                placeholders = ",".join(["?"] * len(chunk))
+                db.execute(
+                    f"UPDATE files SET parent_id = ? WHERE id IN ({placeholders})",
+                    [new_parent_id] + chunk
+                )
 
 
 @dataclass
@@ -561,12 +612,36 @@ class FileBlockMapping:
         
         return block_ids
 
+    @staticmethod
+    def remove_mappings_for_files_batch(file_ids: list[int], repo_path: str = None) -> List[int]:
+        """Remove all block mappings for multiple files and return unique block IDs."""
+        if not file_ids:
+            return []
+        db = get_repository_database(repo_path)
+        if db is None:
+            return []
+            
+        all_block_ids = set()
+        with db.transaction():
+            CHUNK_SIZE = 900
+            for i in range(0, len(file_ids), CHUNK_SIZE):
+                chunk = file_ids[i:i + CHUNK_SIZE]
+                placeholders = ",".join(["?"] * len(chunk))
+                
+                rows = db.fetchall(f"SELECT block_id FROM file_blocks WHERE file_id IN ({placeholders})", tuple(chunk))
+                for row in rows:
+                    all_block_ids.add(row["block_id"])
+                    
+                db.execute(f"DELETE FROM file_blocks WHERE file_id IN ({placeholders})", tuple(chunk))
+                
+        return list(all_block_ids)
+
 
 @dataclass
 class Operation:
     """Operation data model for crash recovery."""
     id: Optional[int]
-    type: str  # 'import', 'export'
+    type: str  # 'import', 'export', 'delete'
     status: str  # 'pending', 'processing', 'cancelling', 'completed', 'failed'
     source_paths: str  # JSON list
     target_path: Optional[str] = None
@@ -595,7 +670,7 @@ class Operation:
                 (type, status, source_paths, target_path, parent_id, total_size)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (type, 'processing', json.dumps(source_paths), target_path, parent_id, total_size)
+                (type, 'processing', json.dumps(source_paths), str(target_path) if target_path else None, parent_id, total_size)
             )
             op_id = cursor.lastrowid
         
@@ -626,7 +701,7 @@ class Operation:
             "UPDATE operations SET processed_size = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (processed_size, self.id)
         )
-        # self.processed_size = processed_size # Optional: don't necessarily need to sync local object if not used
+        self.processed_size = processed_size 
 
     @classmethod
     def get_pending(cls, repo_path: str) -> List["Operation"]:

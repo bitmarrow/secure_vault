@@ -95,7 +95,7 @@ class ProgressWidget(QWidget):
             }
         """)
 
-    def set_progress(self, current: int, total: int, message: str = "", speed: str = "", eta: str = ""):
+    def set_progress(self, current: object, total: object, message: str = "", speed: str = "", eta: str = ""):
         """
         Update progress.
         
