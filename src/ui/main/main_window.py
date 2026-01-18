@@ -382,10 +382,16 @@ class MainWindow(QMainWindow):
         sort_column = header.sortIndicatorSection()
         sort_order = header.sortIndicatorOrder()
         
+        # Get proxy model for index mapping
+        proxy_model = self.tree_view._proxy_model
+        
         def save_expanded(item):
             for row in range(item.rowCount()):
                 child = item.child(row)
-                if self.tree_view.isExpanded(child.index()):
+                # Map source index to proxy index for checking expansion state
+                source_index = child.index()
+                proxy_index = proxy_model.mapFromSource(source_index)
+                if proxy_index.isValid() and self.tree_view.isExpanded(proxy_index):
                     vf = model.get_virtual_file(child)
                     if vf:
                         expanded_ids.add(vf.id)
@@ -404,7 +410,11 @@ class MainWindow(QMainWindow):
                 child = item.child(row)
                 vf = model.get_virtual_file(child)
                 if vf and vf.id in expanded_ids:
-                    self.tree_view.setExpanded(child.index(), True)
+                    # Map source index to proxy index for setting expansion state
+                    source_index = child.index()
+                    proxy_index = proxy_model.mapFromSource(source_index)
+                    if proxy_index.isValid():
+                        self.tree_view.setExpanded(proxy_index, True)
                 restore_expanded(child)
         
         restore_expanded(root)
