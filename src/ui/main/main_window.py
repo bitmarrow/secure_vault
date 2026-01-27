@@ -1187,6 +1187,13 @@ class MainWindow(QMainWindow):
             
             self._load_files()
             self._update_capacity()
+            
+            # Open directory if requested
+            if open_dir:
+                try:
+                    os.startfile(open_dir)
+                except Exception:
+                    pass
         elif message == "__CANCELLED__" or message == "__FAILED__":
             self.progress_widget.set_status(_("status_cancelling")) # Keep progress widget active
             # Perform background cleanup instead of sync
