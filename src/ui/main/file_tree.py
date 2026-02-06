@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (
     Qt, QModelIndex, pyqtSignal, QSortFilterProxyModel
 )
-from PyQt6.QtGui import QStandardItemModel, QStandardItem, QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import QStandardItemModel, QStandardItem, QDragEnterEvent, QDropEvent, QKeyEvent
 from PyQt6.QtWidgets import QFileIconProvider
 
 
@@ -265,6 +265,8 @@ class FileTreeView(QTreeView):
     files_dropped = pyqtSignal(list, object)  # (file_paths, target_parent_id)
     items_moved = pyqtSignal(list, object)  # (file_ids, new_parent_id)
     context_menu_requested = pyqtSignal(QModelIndex, object)  # (index, global_pos)
+    rename_requested = pyqtSignal(object)  # (VirtualFile)
+    delete_requested = pyqtSignal(list)  # (list of VirtualFiles)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -416,3 +418,20 @@ class FileTreeView(QTreeView):
                     seen_ids.add(vf.id)
         
         return files
+
+    def keyPressEvent(self, event: QKeyEvent):
+        """Handle keyboard shortcuts."""
+        if event.key() == Qt.Key.Key_F2:
+            # F2 - Rename
+            files = self.get_selected_files()
+            if len(files) == 1:
+                self.rename_requested.emit(files[0])
+            event.accept()
+        elif event.key() == Qt.Key.Key_Delete:
+            # Delete - Delete files
+            files = self.get_selected_files()
+            if files:
+                self.delete_requested.emit(files)
+            event.accept()
+        else:
+            super().keyPressEvent(event)

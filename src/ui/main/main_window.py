@@ -176,7 +176,6 @@ class MainWindow(QMainWindow):
     def _resume_export(self, op):
         """Resume export with path validation."""
         try:
-            source_file_ids = json.loads(op.source_paths)
             target_path = Path(op.target_path)
             
             # Validation 1: Check decryption target path exists (if resumed)
@@ -194,29 +193,10 @@ class MainWindow(QMainWindow):
                 self._cleanup_current_task(force_record_delete=True)
                 return
 
-            # Validation 2: Check repository file paths (blocks) exist
-            files = []
-            for fid in source_file_ids:
-                vf = VirtualFile.get_by_id(fid, self.repository.path)
-                if not vf:
-                    continue
-                
-                # Check if blocks actually exist in the vault
-                missing_blocks = check_blocks_exist(vf, self.repository)
-                if missing_blocks:
-                    self.logger.error(_("log_resume_failed_blocks", name=vf.name if vf.name else vf.id))
-                    self._current_operation = op
-                    self._active_task = "decrypt_export"
-                    self._cleanup_current_task(force_record_delete=True)
-                    return
-                files.append(vf)
-            
-            if files:
-                self.logger.info(_("log_resume_success", type=_("type_export"), id=op.id))
-                self._on_export_decrypted(files, target_path, existing_op=op)
-            else:
-                self.logger.error(_("log_resume_failed_no_files"))
-                op.delete(self.repository.path)
+            self.logger.info(_("log_resume_success", type=_("type_export"), id=op.id))
+            # Pass empty list for files, as it will be reconstructed from op
+            self._on_export_decrypted([], str(target_path), existing_op=op)
+
         except Exception as e:
             self.logger.error(_("log_task_failed", type=_("type_export"), error=e))
             op.update_status(self.repository.path, 'failed', str(e))
@@ -352,6 +332,8 @@ class MainWindow(QMainWindow):
         self.tree_view.files_dropped.connect(self._on_files_dropped)
         self.tree_view.items_moved.connect(self._on_items_moved)
         self.tree_view.context_menu_requested.connect(self._on_context_menu)
+        self.tree_view.rename_requested.connect(self._on_rename_shortcut)
+        self.tree_view.delete_requested.connect(self._on_delete_shortcut)
         
         # Context menu signals
         self.context_menu.delete_requested.connect(self._on_delete_files)
@@ -796,6 +778,10 @@ class MainWindow(QMainWindow):
         move_ids = []
         
         for vf in vfs:
+            # Skip if file is already in the target directory
+            if vf.parent_id == new_parent_id:
+                continue
+                
             try:
                 current_name = decrypt_metadata(
                     vf.name_encrypted,
@@ -803,21 +789,34 @@ class MainWindow(QMainWindow):
                     vf.name_nonce
                 )
                 
-                # Check for collision and get unique name if needed
-                new_name = get_unique_filename(current_name, existing_names)
-                
-                if new_name != current_name:
+                # Check if name already exists in target directory
+                if current_name in existing_names:
+                    # Calculate what the new name will be
+                    new_name = get_unique_filename(current_name, existing_names)
+                    
+                    # Ask user whether to rename and move
+                    reply = QMessageBox.question(
+                        self,
+                        _("dialog_move_conflict_title"),
+                        _("dialog_move_conflict_msg", name=current_name, new_name=new_name),
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No
+                    )
+                    
+                    if reply != QMessageBox.StandardButton.Yes:
+                        # User chose not to move this file
+                        continue
+                    
+                    # Rename the file
                     name_encrypted, name_nonce = encrypt_metadata(
                         new_name, self.master_key
                     )
                     vf.update_name(name_encrypted, name_nonce, self.repository.path)
                     self.logger.info(_("log_rename_to", name=new_name))
                 else:
-                    # If no rename, add to batch move list
-                    # (Renamed files are technically "moved" too, but update_name doesn't move)
-                    pass
+                    new_name = current_name
                 
-                # Always add to move list for parent_id update
+                # Add to move list for parent_id update
                 move_ids.append(vf.id)
                 # Add to existing names so subsequent files in this batch don't collide with it
                 existing_names.add(new_name)
@@ -857,6 +856,58 @@ class MainWindow(QMainWindow):
         
         self.context_menu.show_menu(files, global_pos)
     
+    def _on_rename_shortcut(self, vf: VirtualFile):
+        """Handle F2 rename shortcut - show dialog then call rename handler."""
+        # Decrypt current name
+        try:
+            current_name = decrypt_metadata(
+                vf.name_encrypted, self.master_key, vf.name_nonce
+            )
+        except Exception:
+            current_name = _("label_unknown")
+        
+        new_name, ok = QInputDialog.getText(
+            self,
+            _("dialog_rename_title"),
+            _("dialog_rename_msg"),
+            text=current_name
+        )
+        
+        if ok and new_name and new_name != current_name:
+            self._on_rename_file(vf, new_name)
+    
+    def _on_delete_shortcut(self, files: list):
+        """Handle Delete key shortcut - show confirmation then call delete handler."""
+        if not files:
+            return
+        
+        # Decrypt names for display
+        for f in files:
+            try:
+                f.name = decrypt_metadata(
+                    f.name_encrypted, self.master_key, f.name_nonce
+                )
+            except Exception:
+                f.name = _("label_encrypt_error")
+        
+        count = len(files)
+        if count == 1:
+            name = files[0].name if files[0].name else _("label_selected_item")
+            message = _("dialog_delete_confirm_msg_single", name=name)
+        else:
+            message = _("dialog_delete_confirm_msg_multiple", count=count)
+        
+        reply = QMessageBox.question(
+            self,
+            _("dialog_delete_confirm_title"),
+            message + _("dialog_delete_confirm_suffix"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self._on_delete_files(files)
+
     def _on_delete_files(self, files: list):
         """Handle delete request with progress and logging."""
         if not files:
@@ -1017,6 +1068,26 @@ class MainWindow(QMainWindow):
         
         self._active_task = "rename"
         
+        # Check for duplicate names in the same directory
+        siblings = VirtualFile.get_children(self.repository.path, vf.parent_id)
+        for sibling in siblings:
+            if sibling.id == vf.id:
+                continue  # Skip self
+            try:
+                sibling_name = decrypt_metadata(
+                    sibling.name_encrypted, self.master_key, sibling.name_nonce
+                )
+                if sibling_name == new_name:
+                    QMessageBox.warning(
+                        self,
+                        _("dialog_rename_title"),
+                        _("dialog_rename_duplicate", name=new_name)
+                    )
+                    self._active_task = None
+                    return
+            except Exception:
+                continue
+        
         name_encrypted, name_nonce = encrypt_metadata(new_name, self.master_key)
         vf.update_name(name_encrypted, name_nonce)
         self._load_files()
@@ -1046,6 +1117,91 @@ class MainWindow(QMainWindow):
         
         # Clear task immediately (sync operation)
         self._active_task = None
+
+    def _resolve_export_tasks(self, selected_files: List[VirtualFile]) -> List[tuple[VirtualFile, str]]:
+        """
+        Resolve the actual list of files to export and their target relative paths.
+        
+        Logic:
+        1. If a selected item has children that are ALSO selected, skip the parent 
+           (assume user wants to manage that branch explicitly).
+        2. IF a selected item implies it's a leaf (no selected children), export it.
+        3. Build the relative path by traversing up. If a parent is in the original selection,
+           include it in the path.
+           
+        Returns:
+            List of (VirtualFile, relative_path_str)
+        """
+        # Set of all selected IDs for O(1) lookup
+        selected_ids = {f.id for f in selected_files}
+        
+        # Build a map of parent -> children IDs within the selection to optimize "has child" check?
+        # Since we don't have the full tree in memory, we have to query DB or use what we have.
+        # But wait, checking "if child is in selected_files" requires knowing the children of the current file.
+        # MainWindow doesn't hold the whole tree structure in memory easily unless we query DB.
+        # HOWEVER, the logic says "judge if *selected* items' child is in *selected* items".
+        # So we only care if any of the OTHER selected items lists this item as parent.
+        
+        # Map: parent_id -> list of selected children IDs
+        selected_children_map = {}
+        for f in selected_files:
+            if f.parent_id:
+                if f.parent_id not in selected_children_map:
+                    selected_children_map[f.parent_id] = []
+                selected_children_map[f.parent_id].append(f.id)
+                
+        export_tasks = []
+        
+        # Helper to get cached name
+        name_cache = {}
+        def get_name(vf):
+            if vf.id in name_cache: return name_cache[vf.id]
+            try:
+                n = decrypt_metadata(vf.name_encrypted, self.master_key, vf.name_nonce)
+                name_cache[vf.id] = n
+                return n
+            except:
+                return f"unknown_{vf.id}"
+
+        # Helper to find VF by ID from selection list (optimization)
+        vf_map = {f.id: f for f in selected_files}
+
+        for vf in selected_files:
+            # Rule 1: "Judge if selected item's child is in selected items"
+            # If yes, this is a container for more specific selections -> Skip this container.
+            if vf.id in selected_children_map:
+                continue
+            
+            # Rule 2: Build file structure based on selected parents.
+            # "Judge if selected item's parent is in selected items"
+            path_parts = []
+            
+            # Walk up parents
+            curr = vf
+            while curr.parent_id and curr.parent_id in selected_ids:
+                # We need the parent object to get its name
+                # Optimistically check if it's in our `selected_files` list (it should be)
+                if curr.parent_id in vf_map:
+                    parent = vf_map[curr.parent_id]
+                    path_parts.insert(0, get_name(parent))
+                    curr = parent
+                else:
+                    # Should not happen if parent_id is in selected_ids
+                    break
+            
+            # The relative path is the accumulated directories
+            # Note: The filename itself is NOT in the relative path, it's added by the exporter.
+            # But the user Requirement says "Final parent node is flattened".
+            # If I have A/B, and A is selected.
+            # Processing B: Parent A is selected. Path parts: ["A"]. Result relative path: "A".
+            # Processing A: Has child B in selection -> Skipped.
+            # Correct.
+            
+            relative_path = os.path.join(*path_parts) if path_parts else ""
+            export_tasks.append((vf, relative_path))
+            
+        return export_tasks
+
     
     def _on_export_decrypted(self, files: list, output_dir: str, existing_op=None):
         """Handle decrypt export request."""
@@ -1055,30 +1211,83 @@ class MainWindow(QMainWindow):
         
         self._active_task = "decrypt_export"
         
-        # Log start
-        names = [vf.name if vf.name else f"ID {vf.id}" for vf in files]
-        self.logger.operation_start(_("type_export"), _("msg_exported_count", count=len(files)), details=_("log_export_target", path=output_dir))
-        self.progress_widget.set_status("Decrypting")
+        # Resolve tasks (structure flattening and filtering)
+        # If resuming, we rely on the tasks stored in the operation (or re-calculate if we trust the logic is deterministic)
+        # But `existing_op.source_paths` will only have the *filtered* IDs.
+        # And `existing_op.metadata` will have the path map.
         
-        # Create or use existing operation record
+        resolved_tasks = [] #(vf, relative_path_str)
+        
         if existing_op:
+            # Resuming: Reconstruct resolved_tasks from DB
             op = existing_op
             self._current_operation = op
+            
+            try:
+                # json is imported at module level, so we don't need it here.
+                # removing local import to avoid UnboundLocalError
+                source_ids = json.loads(op.source_paths)
+                export_map = {}
+                if op.metadata:
+                    try:
+                        meta = json.loads(op.metadata)
+                        export_map = meta.get("export_map", {})
+                    except: pass
+                
+                # Fetch only the files we need to export
+                from src.database.models import VirtualFile
+                vfs = VirtualFile.get_batch(source_ids, self.repository.path)
+                
+                # Reconstruct list
+                # Note: vfs might be unordered, we might want to preserve order if possible, but map lookup is fine
+                for vf in vfs:
+                    # Provide default path "." if missing (shouldn't happen for valid ops)
+                    rel_path = export_map.get(str(vf.id), "")
+                    resolved_tasks.append((vf, rel_path))
+                    
+                target_files = vfs # For verification below
+                
+            except Exception as e:
+                self.logger.error(f"Failed to resume export setup: {e}")
+                self._active_task = None
+                return
         else:
-            source_ids = [f.id for f in files]
+            # New Operation: Calculate tasks
+            resolved_tasks = self._resolve_export_tasks(files)
+            
+            if not resolved_tasks:
+                self.logger.info(_("msg_no_files_to_export"))
+                self._active_task = None
+                return
+
+            target_files = [t[0] for t in resolved_tasks]
+            
+            # Prepare metadata map: {str(id): relative_path}
+            export_map = {str(vf.id): path for vf, path in resolved_tasks}
+            
+            # Create operation record
+            source_ids = [vf.id for vf in target_files]
+            
             op = Operation.create(
                 self.repository.path, 
                 'export', 
                 source_ids, 
-                target_path=output_dir
-            )
+                target_path=output_dir,
+                total_size=0
+            ) 
+            op.update_metadata(self.repository.path, json.dumps({"export_map": export_map}))
             self._current_operation = op
             
-        # Check blocks exist
-        for vf in files:
+        # Log start
+        # Use filtered count
+        self.logger.operation_start(_("type_export"), _("msg_exported_count", count=len(target_files)), details=_("log_export_target", path=output_dir))
+        self.progress_widget.set_status("Decrypting")
+
+        # Check blocks exist (only for files we are actually exporting)
+        for vf in target_files:
             missing = check_blocks_exist(vf, self.repository)
             if missing:
-                name = vf.name if vf.name else f"ID {vf.id}"
+                name = decrypt_metadata(vf.name_encrypted, self.master_key, vf.name_nonce)
                 QMessageBox.warning(
                     self,
                     _("dialog_export_failed_title"),
@@ -1091,23 +1300,23 @@ class MainWindow(QMainWindow):
                 return
         
         progress_callback = self._make_progress_callback(op)
-
+        
+        # Conflict check removed as per user request - always overwrite
+        skip_paths = set()
+        
         exporter = FileExporter(
             self.repository,
             self.master_key,
             progress_callback,
             is_cancelled=self._worker_ref_callback,
-            operation=op
+            operation=op,
+            skip_paths=skip_paths
         )
-        # Store in MainWindow if we want, but local closure reference is fine as long as we don't need it elsewhere
-        # We don't have a self._current_exporter attribute used in cleanup yet, 
-        # but let's add it for consistency if we want to cleanup exported files.
-        # Actually our cleanup logic uses op.source_paths, so it doesn't need exporter ref.
         
         def export():
-            # Pre-calculate total size
+            # Pre-calculate total size on the FILTERED set
             total_size = FileExporter.calculate_total_export_size(
-                files, self.repository.path, progress_callback
+                target_files, self.repository.path, progress_callback
             )
             
             # Update op with total size
@@ -1116,13 +1325,17 @@ class MainWindow(QMainWindow):
                 db.execute("UPDATE operations SET total_size = ? WHERE id = ?", (total_size, op.id))
                 op.total_size = total_size # Update locally for callback
 
-            # Always start from 0 because Exporter will reconstruct progress via scanning (avoid double counting)
+            # Always start from 0 because Exporter will reconstruct progress via scanning
             exporter.set_progress_params(0, total_size)
             
-            for vf in files:
+            for vf, rel_path in resolved_tasks:
                 if self._worker.is_cancelled():
                     return
-                success, errors = exporter.export_decrypted(vf, Path(output_dir), reset_progress=False)
+                
+                # Export to specific sub-directory
+                current_target_dir = Path(output_dir) / rel_path
+                
+                success, errors = exporter.export_decrypted(vf, current_target_dir, reset_progress=False)
                 if errors:
                     return _("error_export_generic", error=errors[0])
             
@@ -1131,11 +1344,19 @@ class MainWindow(QMainWindow):
             
             return None  # Success
         
+        # Gather names for logging
+        log_names = []
+        for vf in target_files:
+             try:
+                 log_names.append(decrypt_metadata(vf.name_encrypted, self.master_key, vf.name_nonce))
+             except:
+                 log_names.append(f"ID {vf.id}")
+                 
         self._run_in_background(
             export, 
-            _("msg_exported_count", count=len(files)), 
+            _("msg_exported_count", count=len(target_files)), 
             open_dir=output_dir,
-            log_items=names,
+            log_items=log_names,
             log_action=_("log_export")
         )
     

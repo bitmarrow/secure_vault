@@ -504,7 +504,8 @@ class FileExporter:
         master_key: bytes,
         progress_callback: Optional[Callable[[int, int, str, str, str], None]] = None,
         is_cancelled: Optional[Callable[[], bool]] = None,
-        operation: Optional["Operation"] = None
+        operation: Optional["Operation"] = None,
+        skip_paths: Optional[set] = None
     ):
         """
         Initialize file exporter.
@@ -515,6 +516,7 @@ class FileExporter:
             progress_callback: Callback for progress updates
             is_cancelled: Optional callback to check for cancellation
             operation: Existing operation to resume
+            skip_paths: Set of (output_dir, name) tuples to skip during export
         """
         self.repository = repository
         self.master_key = master_key
@@ -522,6 +524,7 @@ class FileExporter:
         self.block_manager = BlockManager(repository.path, master_key)
         self.is_cancelled = is_cancelled or (lambda: False)
         self.logger = get_logger()
+        self.skip_paths = skip_paths or set()
         
         # Unified throttled callback for both UI and DB
         def unified_callback(current, total, msg, speed, eta):
@@ -583,6 +586,14 @@ class FileExporter:
             self.master_key,
             virtual_file.name_nonce
         )
+        
+        # Check if this path should be skipped (user chose not to overwrite)
+        if (str(output_dir), name) in self.skip_paths:
+            self.logger.info(f"Skipping export of {name} (user chose not to overwrite)")
+            # Update progress to account for skipped size
+            skipped_size = self._calculate_total_size(virtual_file)
+            self.progress_tracker.update(skipped_size, f"Skipped: {name}")
+            return True, []
         
         if virtual_file.is_directory:
             self._export_folder_recursive(virtual_file, output_dir, name)
